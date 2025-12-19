@@ -247,6 +247,15 @@ class DatasetArguments(CustomDatasetArguments):
             "Default is set to True."
         },
     )
+    use_loss_mask: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use a loss mask from the dataset. When True, expects "
+            "the dataset to contain a 'loss_mask' field that indicates which tokens "
+            "should be included in loss calculations (e.g., for masking out prompts "
+            "and only computing loss on generated tokens). Default is False."
+        },
+    )
 
     def is_dataset_provided(self) -> bool:
         return self.dataset is not None or self.dataset_path is not None
