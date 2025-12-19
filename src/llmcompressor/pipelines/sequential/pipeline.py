@@ -1,4 +1,5 @@
 import contextlib
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,7 +25,12 @@ from llmcompressor.utils.helpers import (
 if TYPE_CHECKING:
     from llmcompressor.args.dataset_arguments import DatasetArguments
 
-__all__ = ["SequentialPipeline"]
+__all__ = ["SequentialPipeline", "_current_loss_mask"]
+
+# Context variable to store the current batch's loss_mask for hooks to access
+_current_loss_mask: ContextVar[torch.Tensor | None] = ContextVar(
+    "_current_loss_mask", default=None
+)
 
 
 @CalibrationPipeline.register("sequential")
@@ -104,7 +110,17 @@ class SequentialPipeline(CalibrationPipeline):
                     # do a preliminary pass to trigger modifier hooks
                     for batch_idx in tqdm(range(len(dataloader)), desc=calib_desc):
                         inputs = activations.fetch(batch_idx, subgraph.input_names)
+                        
+                        # Set loss_mask in context variable if enabled, so hooks can access it
+                        if dataset_args.use_loss_mask:
+                            loss_mask_dict = activations.fetch(batch_idx, ["loss_mask"])
+                            _current_loss_mask.set(loss_mask_dict.get("loss_mask"))
+                        
                         subgraph.forward(model, **inputs)
+                        
+                        # Clear the context variable after forward pass
+                        if dataset_args.use_loss_mask:
+                            _current_loss_mask.set(None)
 
                     LifecycleCallbacks.sequential_epoch_end(subgraph)
 

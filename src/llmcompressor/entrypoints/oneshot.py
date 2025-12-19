@@ -264,6 +264,7 @@ def oneshot(
     min_tokens_per_module: float | None = None,
     moe_calibrate_all_experts: bool = True,
     quantization_aware_calibration: bool = True,
+    use_loss_mask: bool = False,
     # Miscellaneous arguments
     output_dir: str | None = None,
     log_dir: str | None = None,
@@ -339,6 +340,10 @@ def oneshot(
         calibration in the sequential pipeline. When True, quantization is applied
         during forward pass in calibration. When False, quantization is disabled
         during forward pass in calibration. Default is set to True.
+    :param use_loss_mask: Whether to use a loss mask from the dataset. When True,
+        expects the dataset to contain a 'loss_mask' field that indicates which
+        tokens should be included in loss calculations (e.g., for masking out
+        prompts and only computing loss on generated tokens). Default is False.
 
     # Miscellaneous arguments
     :param output_dir: Path to save the output model after calibration.

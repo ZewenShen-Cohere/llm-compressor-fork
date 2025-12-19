@@ -39,6 +39,7 @@ from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.observers.base import Observer
 from llmcompressor.pipelines.cache import IntermediatesCache
+from llmcompressor.pipelines.sequential.pipeline import _current_loss_mask
 from llmcompressor.utils.fsdp.helpers import get_fsdp_parent
 from llmcompressor.utils.helpers import calibration_forward_context
 from llmcompressor.utils.pytorch.module import (
@@ -360,8 +361,37 @@ class AWQModifier(Modifier, QuantizationMixin):
                 args: tuple[torch.Tensor, ...],
                 _output: torch.Tensor,
             ):
+                # Get activation tensor: shape [batch, seq_len, hidden_dim]
+                activations = args[0].abs().detach()
+                
+                # Flatten activations: [batch * seq_len, hidden_dim]
+                flat_activations = activations.flatten(0, -2)
+                
+                # Try to get loss_mask from context variable
+                loss_mask = _current_loss_mask.get()
+                
+                if loss_mask is not None:
+                    # loss_mask shape: [batch, seq_len]
+                    # Flatten to [batch * seq_len]
+                    flat_mask = loss_mask.flatten().to(activations.device)
+                    
+                    # Filter: only keep rows where mask == 1
+                    valid_mask = flat_mask > 0
+                    if valid_mask.any():
+                        flat_activations = flat_activations[valid_mask]
+                    else:
+                        # No valid tokens in this batch, use zeros
+                        logger.warning(
+                            f"No valid tokens (mask==1) found for {smooth_name} in current batch"
+                        )
+                        flat_activations = torch.zeros(
+                            (1, activations.shape[-1]), 
+                            device=activations.device,
+                            dtype=activations.dtype
+                        )
+                
                 act_mean, count = _accumulate_mean(
-                    args[0].abs().detach().flatten(0, -2),
+                    flat_activations,
                     self._smooth_activation_means.get(smooth_name, None),
                 )
                 self._smooth_activation_means[smooth_name] = (act_mean.cpu(), count)
@@ -386,8 +416,11 @@ class AWQModifier(Modifier, QuantizationMixin):
             # input activations to balance layers needed for loss function
             # storing inputs to first balance layer is sufficient
             # other balance layers get the same input
+
+            #(zewen): this should be improved
+            layer_to_hook = mapping.parent.mlp if hasattr(mapping.parent, 'mlp') else mapping.balance_layers[0]
             self.register_hook(
-                mapping.balance_layers[0],
+                layer_to_hook,
                 create_cache_smooth_activations_hook_fn(mapping.smooth_name),
                 "forward",
             )
