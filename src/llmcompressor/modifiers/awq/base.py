@@ -163,6 +163,10 @@ class AWQModifier(Modifier, QuantizationMixin):
     _parent_args_cache: dict[Module, IntermediatesCache] = PrivateAttr(
         default_factory=dict
     )
+    # Cache loss_mask for each parent module, one mask per batch
+    _loss_masks: list[torch.Tensor | None] = PrivateAttr(
+        default_factory=list
+    )
     # Dict[smooth layer name, (activation means, activation counts)]
     _smooth_activation_means: dict[str, tuple[torch.FloatTensor, int]] = PrivateAttr(
         default_factory=dict
@@ -270,6 +274,7 @@ class AWQModifier(Modifier, QuantizationMixin):
             self.on_end(state, None)
 
         self._parent_args_cache.clear()
+        self._loss_masks = []
         self._smooth_activation_means.clear()
         self._resolved_mappings.clear()
 
@@ -383,6 +388,10 @@ class AWQModifier(Modifier, QuantizationMixin):
             values = inspect.signature(module.forward).bind(*args, **kwargs)
             self._parent_args_cache[module].append(values.arguments)
 
+            loss_mask = _current_loss_mask.get()
+            self._loss_masks.append(loss_mask)
+
+
         def create_cache_smooth_activations_hook_fn(smooth_name):
             def cache_smooth_activations_hook(
                 _module: Module,
@@ -401,6 +410,7 @@ class AWQModifier(Modifier, QuantizationMixin):
                 if loss_mask is not None:
                     # loss_mask shape: [batch, seq_len]
                     # Flatten to [batch * seq_len]
+
                     flat_mask = loss_mask.flatten().to(activations.device)
                     
                     # Filter: only keep rows where mask == 1
@@ -747,11 +757,45 @@ class AWQModifier(Modifier, QuantizationMixin):
         num_elements = 0
 
         # Compute the MSE loss for each batch
-        for fp16_batch, int_w_batch in zip(fp16_outputs, int_w_outputs):
+        for batch_idx, (fp16_batch, int_w_batch) in enumerate(
+            zip(fp16_outputs, int_w_outputs)
+        ):
+            int_w_batch = int_w_batch.to(fp16_batch.device)
+            
+            # Apply mask if available for this batch
+            if batch_idx < len(self._loss_masks) and self._loss_masks[batch_idx] is not None:
+                mask = self._loss_masks[batch_idx].to(fp16_batch.device)
+                
+                # mask shape: [batch, seq_len]
+                # output shape: [batch, seq_len, hidden_dim]
+                # Flatten both to [batch * seq_len, hidden_dim] and [batch * seq_len]
+                fp16_flat = fp16_batch.flatten(0, -2)  # [batch * seq_len, hidden_dim]
+                int_w_flat = int_w_batch.flatten(0, -2)  # [batch * seq_len, hidden_dim]
+                mask_flat = mask.flatten()  # [batch * seq_len]
+                
+                # Only compute loss on valid (mask==1) positions
+                valid_mask = (mask_flat == 1)
+                if valid_mask.any():
+                    # Extract only the valid tokens using boolean indexing
+                    fp16_valid = fp16_flat[valid_mask]  # [num_valid, hidden_dim]
+                    int_w_valid = int_w_flat[valid_mask]  # [num_valid, hidden_dim]
+                    
+                    # Compute MSE loss on valid tokens only
+
+                else:
+                    # No valid tokens, skip this batch
+                    logger.warning(
+                        f"No valid tokens (mask==1) found in batch {batch_idx} "
+                        "during MSE loss computation"
+                    )
+            else:
+                fp16_valid = fp16_batch
+                int_w_valid = int_w_batch
+
             loss += torch.nn.functional.mse_loss(
-                fp16_batch, int_w_batch.to(fp16_batch.device), reduction="sum"
+                fp16_valid, int_w_valid, reduction="sum"
             ).item()
-            num_elements += fp16_batch.numel()
+            num_elements += fp16_valid.numel()
 
         # Normalize the loss by the total number of elements
         loss /= num_elements
