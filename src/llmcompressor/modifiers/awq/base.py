@@ -33,9 +33,11 @@ from llmcompressor.modifiers.awq.mappings import (
 )
 from llmcompressor.modifiers.quantization.calibration import (
     call_observer,
+    update_weight_global_scale,
     update_weight_zp_scale,
 )
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
+from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.observers.base import Observer
 from llmcompressor.pipelines.cache import IntermediatesCache
@@ -182,8 +184,6 @@ class AWQModifier(Modifier, QuantizationMixin):
                 if (
                     hasattr(module, "quantization_scheme")
                     and hasattr(module.quantization_scheme, "weights")
-                    and module.quantization_scheme.weights.strategy
-                    == QuantizationStrategy.TENSOR
                 ):
                     raise ValueError(
                         "duo_scaling is only supported with per-channel quantization "
@@ -241,10 +241,21 @@ class AWQModifier(Modifier, QuantizationMixin):
 
         self.ended_ = True
 
-        for _, module in tqdm(
-            match_named_modules(state.model, self.resolved_targets, self.ignore),
-            desc="Calibrating weights",
-        ):
+        named_modules = list(
+            match_named_modules(state.model, self.resolved_targets, self.ignore)
+        )
+
+        # For TENSOR_GROUP (nvfp4), calculate global scales after smoothing
+        for _, module in tqdm(named_modules, desc="Updating global scales"):
+            update_weight_global_scale(module)
+
+        # For TENSOR_GROUP (nvfp4), fuse global scales for attention and MLP layers
+        # This is a requirement for vLLM inference.
+        for module in tqdm(state.model.modules(), desc="Fusing global scales"):
+            update_fused_layer_weight_global_scales(module)
+
+        # Calculate scales and zero points using the fused global scales
+        for _, module in tqdm(named_modules, desc="Calibrating weights"):
             update_weight_zp_scale(module)
 
         QuantizationMixin.end_calibration(self, state.model)
@@ -608,11 +619,15 @@ class AWQModifier(Modifier, QuantizationMixin):
 
                     w_qscheme = balance_layer.quantization_scheme.weights
                     balance_layer.weight.mul_(_scalesview)
+                    # For TENSOR_GROUP (nvfp4), need to calculate global scale
+                    should_calculate_gparam = (
+                        w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
+                    )
                     call_observer(
                         balance_layer,
                         "weight",
                         balance_layer.weight,
-                        # TODO test should_calculate_gparam for nvfp4 support
+                        should_calculate_gparam=should_calculate_gparam,
                     )
                     update_offload_parameter(
                         balance_layer,
@@ -778,7 +793,7 @@ class AWQModifier(Modifier, QuantizationMixin):
                     chunk_size = weight.numel()
                 case QuantizationStrategy.CHANNEL:
                     chunk_size = weight.size(1)
-                case QuantizationStrategy.GROUP:
+                case QuantizationStrategy.GROUP | QuantizationStrategy.TENSOR_GROUP:
                     chunk_size = q_args.group_size
                 case QuantizationStrategy.BLOCK:
                     block_height, block_width = q_args.block_structure
