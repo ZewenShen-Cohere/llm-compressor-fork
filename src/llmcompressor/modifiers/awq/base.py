@@ -184,6 +184,8 @@ class AWQModifier(Modifier, QuantizationMixin):
                 if (
                     hasattr(module, "quantization_scheme")
                     and hasattr(module.quantization_scheme, "weights")
+                    and module.quantization_scheme.weights.strategy
+                    == QuantizationStrategy.TENSOR
                 ):
                     raise ValueError(
                         "duo_scaling is only supported with per-channel quantization "
