@@ -293,7 +293,7 @@ class AWQModifier(Modifier, QuantizationMixin):
         module_to_name = get_module_to_name_dict(model)
         for mapping in self.mappings:
             for smooth_layers, *nested_balance_layers in match_modules_set(
-                model, (mapping.smooth_layer, *mapping.balance_layers), self.ignore
+                model, (mapping.smooth_layer, *mapping.balance_layers)
             ):
                 if len(smooth_layers) > 1:
                     raise ValueError(
@@ -532,6 +532,8 @@ class AWQModifier(Modifier, QuantizationMixin):
 
                 # remove caches needed to smooth this mapping
                 del self._smooth_activation_means[mapping.smooth_name]
+                # reset loss masks after processing this mapping
+                self._loss_masks = []
 
         for v in self._parent_args_cache.values():
             v.batch_intermediates.clear()
