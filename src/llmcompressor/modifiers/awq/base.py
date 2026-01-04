@@ -643,6 +643,15 @@ class AWQModifier(Modifier, QuantizationMixin):
                         / _scalesview,
                     )
 
+                # Apply fused global scales for TENSOR_GROUP during grid search
+                # to match inference behavior
+                if balance_layers_to_patch and all(
+                    getattr(layer.quantization_scheme.weights, "strategy", None)
+                    == QuantizationStrategy.TENSOR_GROUP
+                    for layer in balance_layers_to_patch
+                ):
+                    update_fused_layer_weight_global_scales(mapping.parent)
+
                 # W * X
                 int_w_outputs = self._run_samples(mapping.parent)
 
