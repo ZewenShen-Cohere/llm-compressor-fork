@@ -24,7 +24,7 @@ from torch.nn import Module
 from torch.utils._pytree import tree_leaves
 from tqdm import tqdm
 
-from llmcompressor.core import Event, EventType, State
+from llmcompressor.core import Event, EventType, State, state
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.awq.mappings import (
     AWQMapping,
@@ -690,12 +690,16 @@ class AWQModifier(Modifier, QuantizationMixin):
 
                 # Apply fused global scales for TENSOR_GROUP during grid search
                 # to match inference behavior
-                if balance_layers_to_patch and all(
-                    getattr(layer.quantization_scheme.weights, "strategy", None)
-                    == QuantizationStrategy.TENSOR_GROUP
-                    for layer in balance_layers_to_patch
-                ):
-                    update_fused_layer_weight_global_scales(mapping.parent)
+                # if balance_layers_to_patch and all(
+                #     getattr(layer.quantization_scheme.weights, "strategy", None)
+                #     == QuantizationStrategy.TENSOR_GROUP
+                #     for layer in balance_layers_to_patch
+                # ):
+                #     update_fused_layer_weight_global_scales(mapping.parent)
+
+                update_fused_layer_weight_global_scales(mapping.parent.self_attn)
+                for module in mapping.parent.mlp.modules():
+                    update_fused_layer_weight_global_scales(module)
 
                 # W * X
                 int_w_outputs = self._run_samples(mapping.parent)
