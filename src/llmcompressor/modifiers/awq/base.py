@@ -471,13 +471,13 @@ class AWQModifier(Modifier, QuantizationMixin):
 
             # The line below is useful for models that use parallel transformer block,
             # such as gemma 3, command A. Need a better way to integrate it to the code.
-            # layer_to_hook = (
-            #     mapping.parent.mlp
-            #     if hasattr(mapping.parent, 'mlp')
-            #     else mapping.balance_layers[0]
-            # )
+            layer_to_hook = (
+                mapping.parent.mlp
+                if hasattr(mapping.parent, 'mlp')
+                else mapping.balance_layers[0]
+            )
             self.register_hook(
-                mapping.balance_layers[0],
+                layer_to_hook,
                 create_cache_smooth_activations_hook_fn(mapping.smooth_name),
                 "forward",
             )
@@ -536,8 +536,6 @@ class AWQModifier(Modifier, QuantizationMixin):
                 orig_layer_weights = {
                     balance_layer: balance_layer.weight.clone()
                     for balance_layer in mapping.balance_layers
-                    if hasattr(balance_layer, "quantization_scheme")
-                    and hasattr(balance_layer.quantization_scheme, "weights")
                 }
 
                 best_scales = self._compute_best_scale(
