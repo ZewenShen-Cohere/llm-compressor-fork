@@ -26,7 +26,7 @@ from pathlib import Path
 # ── Docker image ──────────────────────────────────────────────────────────────
 
 VLLM_IMAGE = "vllm/vllm-openai:v0.15.0"
-CONTAINER_NAME = "vllm-bench"
+CONTAINER_PREFIX = "vllm-bench"
 
 # ── Quantization tags to benchmark ────────────────────────────────────────────
 
@@ -57,17 +57,29 @@ BACKEND_PRESETS: dict[str, dict] = {
             "export LD_LIBRARY_PATH=/usr/local/cuda-12.9/compat:${LD_LIBRARY_PATH:-}",
         ],
     },
-    # Add more presets here, e.g.:
-    # "h100": {
-    #     "env": {
-    #         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-    #     },
-    #     "engine_flags": {
-    #         "enable_chunked_prefill": True,
-    #         "max_num_batched_tokens": 16384,
-    #     },
-    #     "setup_cmds": [],
-    # },
+    "h100": {
+        "env": {
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        },
+        "engine_flags": {
+            "enable_chunked_prefill": True,
+            "max_num_batched_tokens": 8192,
+        },
+        "setup_cmds": [],
+    },
+    "mi300x": {
+        "env": {
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "VLLM_ROCM_USE_AITER": "1",
+            "VLLM_ROCM_USE_AITER_MHA": "1",
+            "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "0",
+        },
+        "engine_flags": {
+            "enable_chunked_prefill": True,
+            "max_num_batched_tokens": 8192,
+        },
+        "setup_cmds": [],
+    },
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,13 +121,14 @@ def build_server_cmd(
     port: int,
     max_model_len: int | None,
     gpus: str,
+    container_name: str,
 ) -> list[str]:
     """Build the `docker run` command for the vLLM server."""
     hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 
     cmd = [
         "docker", "run", "-d",
-        "--name", CONTAINER_NAME,
+        "--name", container_name,
         "--runtime", "nvidia",
         "--ipc=host",
         "-v", f"{ckpt_dir}:/models:ro",
@@ -159,11 +172,11 @@ def build_server_cmd(
     return cmd
 
 
-def start_server(cmd: list[str]) -> None:
+def start_server(cmd: list[str], container_name: str) -> None:
     """Start the vLLM server container."""
     # Make sure no stale container exists
     subprocess.run(
-        ["docker", "rm", "-f", CONTAINER_NAME],
+        ["docker", "rm", "-f", container_name],
         capture_output=True,
         check=False,
     )
@@ -179,7 +192,9 @@ def start_server(cmd: list[str]) -> None:
     print(f"  Container started: {result.stdout.strip()[:12]}")
 
 
-def wait_for_health(port: int, timeout: int = 900, interval: int = 10) -> None:
+def wait_for_health(
+    port: int, container_name: str, timeout: int = 900, interval: int = 10,
+) -> None:
     """Poll the /health endpoint until the server is ready."""
     url = f"http://localhost:{port}/health"
     deadline = time.time() + timeout
@@ -197,16 +212,16 @@ def wait_for_health(port: int, timeout: int = 900, interval: int = 10) -> None:
 
     # If we get here, the server never became healthy — dump logs for debugging
     print("  ERROR: Server did not become healthy. Container logs:")
-    subprocess.run(["docker", "logs", "--tail", "80", CONTAINER_NAME], check=False)
-    stop_server()
+    subprocess.run(["docker", "logs", "--tail", "80", container_name], check=False)
+    stop_server(container_name)
     sys.exit(1)
 
 
-def stop_server() -> None:
+def stop_server(container_name: str) -> None:
     """Stop and remove the container."""
-    print(f"  Stopping container {CONTAINER_NAME} ...")
-    subprocess.run(["docker", "stop", CONTAINER_NAME], capture_output=True, check=False)
-    subprocess.run(["docker", "rm", CONTAINER_NAME], capture_output=True, check=False)
+    print(f"  Stopping container {container_name} ...")
+    subprocess.run(["docker", "stop", container_name], capture_output=True, check=False)
+    subprocess.run(["docker", "rm", container_name], capture_output=True, check=False)
 
 
 # ── Benchmark runner ──────────────────────────────────────────────────────────
@@ -398,11 +413,13 @@ def main() -> None:
     for tag in args.quant_tags:
         ckpt_name = f"{args.model_name}-{tag}-rtn-moe"
         ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-        result_subdir = os.path.join(args.output_dir, f"{tag}-rtn-moe")
+        result_subdir = os.path.join(args.output_dir, f"{tag}-rtn-moe-tp{args.tp}")
+        container_name = f"{CONTAINER_PREFIX}-{tag}"
         os.makedirs(result_subdir, exist_ok=True)
 
         print(f"\n{'#' * 70}")
         print(f"  Checkpoint: {ckpt_name}")
+        print(f"  Container : {container_name}")
         print(f"{'#' * 70}")
 
         if not os.path.isdir(ckpt_path):
@@ -418,9 +435,10 @@ def main() -> None:
             port=args.port,
             max_model_len=args.max_model_len,
             gpus=args.gpus,
+            container_name=container_name,
         )
-        start_server(server_cmd)
-        wait_for_health(args.port)
+        start_server(server_cmd, container_name)
+        wait_for_health(args.port, container_name)
 
         try:
             for in_len, out_len in zip(args.input_lens, args.output_lens):
@@ -441,7 +459,7 @@ def main() -> None:
                     )
                     results.append(os.path.join(result_subdir, filename))
         finally:
-            stop_server()
+            stop_server(container_name)
 
     # Summary
     print(f"\n{'=' * 70}")
