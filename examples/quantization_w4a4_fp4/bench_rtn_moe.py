@@ -71,14 +71,19 @@ BACKEND_PRESETS: dict[str, dict] = {
         "setup_cmds": [],
     },
     "mi300x": {
-        "image": "vllm/vllm-openai:v0.15.0-rocm",
+        "image": "vllm/vllm-openai-rocm:v0.15.0",
         "gpu_mode": "rocm",                # GPUs exposed via /dev/kfd + /dev/dri
         "docker_flags": [
-            "--privileged",
-            "--device", "/dev/kfd",
-            "--device", "/dev/dri",
-            "--shm-size=500g",
             "--security-opt", "seccomp=unconfined",
+            "--net", "host",
+            "--shm-size=500g",
+            "--ulimit", "memlock=-1",
+            "--ulimit", "stack=67108864",
+            "--group-add", "video",
+            "--device=/dev/dri",
+            "--device=/dev/kfd",
+            "--cap-add=SYS_PTRACE",
+            "--ipc=host",
         ],
         "env": {
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -150,11 +155,15 @@ def build_server_cmd(
     # Backend-specific Docker flags (runtime, device passthrough, shm, etc.)
     cmd.extend(preset.get("docker_flags", []))
 
-    # GPU device passthrough — only needed for NVIDIA CDI mode;
-    # ROCm exposes all GPUs via /dev/kfd + /dev/dri (already in docker_flags).
+    # GPU device passthrough
     if preset.get("gpu_mode") == "nvidia_cdi":
+        # NVIDIA CDI: expose specific GPUs via --device=nvidia.com/gpu=N
         for gpu_id in gpus.split(","):
             cmd.extend(["--device", f"nvidia.com/gpu={gpu_id.strip()}"])
+    elif preset.get("gpu_mode") == "rocm":
+        # ROCm: all GPUs are exposed via /dev/kfd + /dev/dri (in docker_flags);
+        # restrict visibility with HIP_VISIBLE_DEVICES.
+        cmd.extend(["-e", f"HIP_VISIBLE_DEVICES={gpus}"])
 
     # Inject env vars from the backend preset
     for key, value in preset.get("env", {}).items():
@@ -165,6 +174,7 @@ def build_server_cmd(
         f"/models/{ckpt_name}",
         "-tp", str(tp),
         "--port", str(port),
+        "--gpu-memory-utilization", "0.9"
     ]
     serve_args.extend(engine_flags_to_args(preset.get("engine_flags", {})))
     if max_model_len is not None:
@@ -271,7 +281,6 @@ def run_bench(
         "--save-result",
         "--result-dir", result_dir,
         "--result-filename", result_filename,
-        "--gpu-memory-utilization", "0.95",
     ]
 
     print(f"\n{'=' * 70}")
@@ -375,6 +384,16 @@ def parse_args() -> argparse.Namespace:
         default=QUANT_TAGS,
         help="Quantization tags to benchmark",
     )
+    parser.add_argument(
+        "--docker-image",
+        type=str,
+        default=None,
+        help=(
+            "Override the Docker image from the backend preset. "
+            "Useful when the preset image's ROCm/CUDA version doesn't "
+            "match the host driver."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -392,7 +411,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    preset = BACKEND_PRESETS[args.backend]
+    preset = BACKEND_PRESETS[args.backend].copy()
+    if args.docker_image:
+        preset["image"] = args.docker_image
     ckpt_dir = os.path.abspath(args.ckpt_dir)
 
     # Print configuration
