@@ -23,9 +23,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-# ── Docker image ──────────────────────────────────────────────────────────────
-
-VLLM_IMAGE = "vllm/vllm-openai:v0.15.0"
 CONTAINER_PREFIX = "vllm-bench"
 
 # ── Quantization tags to benchmark ────────────────────────────────────────────
@@ -44,6 +41,9 @@ QUANT_TAGS = ["nvfp4a16", "mxfp4a16", "int4a16"]
 
 BACKEND_PRESETS: dict[str, dict] = {
     "b200": {
+        "image": "vllm/vllm-openai:v0.15.0",
+        "gpu_mode": "nvidia_cdi",          # --device=nvidia.com/gpu=N per GPU
+        "docker_flags": ["--runtime", "nvidia", "--ipc=host"],
         "env": {
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "VLLM_ATTENTION_BACKEND": "FLASHINFER",
@@ -58,6 +58,9 @@ BACKEND_PRESETS: dict[str, dict] = {
         ],
     },
     "h100": {
+        "image": "vllm/vllm-openai:v0.15.0",
+        "gpu_mode": "nvidia_cdi",
+        "docker_flags": ["--ipc=host"],
         "env": {
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         },
@@ -68,6 +71,15 @@ BACKEND_PRESETS: dict[str, dict] = {
         "setup_cmds": [],
     },
     "mi300x": {
+        "image": "vllm/vllm-openai:v0.15.0-rocm",
+        "gpu_mode": "rocm",                # GPUs exposed via /dev/kfd + /dev/dri
+        "docker_flags": [
+            "--privileged",
+            "--device", "/dev/kfd",
+            "--device", "/dev/dri",
+            "--shm-size=500g",
+            "--security-opt", "seccomp=unconfined",
+        ],
         "env": {
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "VLLM_ROCM_USE_AITER": "1",
@@ -125,21 +137,24 @@ def build_server_cmd(
 ) -> list[str]:
     """Build the `docker run` command for the vLLM server."""
     hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    image = preset["image"]
 
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
-        "--runtime", "nvidia",
-        "--ipc=host",
         "-v", f"{ckpt_dir}:/models:ro",
         "-v", f"{hf_home}:/root/.cache/huggingface",
         "-p", f"{port}:{port}",
     ]
 
-    # Expose GPUs via CDI device syntax (required on B200 / newer nvidia-container-toolkit)
-    for gpu_id in gpus.split(","):
-        cmd.extend(["--device", f"nvidia.com/gpu={gpu_id.strip()}"])
-    
+    # Backend-specific Docker flags (runtime, device passthrough, shm, etc.)
+    cmd.extend(preset.get("docker_flags", []))
+
+    # GPU device passthrough — only needed for NVIDIA CDI mode;
+    # ROCm exposes all GPUs via /dev/kfd + /dev/dri (already in docker_flags).
+    if preset.get("gpu_mode") == "nvidia_cdi":
+        for gpu_id in gpus.split(","):
+            cmd.extend(["--device", f"nvidia.com/gpu={gpu_id.strip()}"])
 
     # Inject env vars from the backend preset
     for key, value in preset.get("env", {}).items():
@@ -159,14 +174,14 @@ def build_server_cmd(
     if setup_cmds:
         # Override entrypoint to run setup commands before vllm serve
         cmd.extend(["--entrypoint", "bash"])
-        cmd.append(VLLM_IMAGE)
+        cmd.append(image)
         setup_script = " && ".join(setup_cmds)
         serve_cmd = "vllm serve " + " ".join(serve_args)
         cmd.extend(["-c", f"{setup_script} && {serve_cmd}"])
     else:
         # The vllm/vllm-openai image has ENTRYPOINT ["vllm", "serve"],
         # so we only pass the model path and flags.
-        cmd.append(VLLM_IMAGE)
+        cmd.append(image)
         cmd.extend(serve_args)
 
     return cmd
@@ -256,6 +271,7 @@ def run_bench(
         "--save-result",
         "--result-dir", result_dir,
         "--result-filename", result_filename,
+        "--gpu-memory-utilization", "0.95",
     ]
 
     print(f"\n{'=' * 70}")
@@ -391,7 +407,7 @@ def main() -> None:
     print(f"  Concurrencies : {args.concurrencies}")
     print(f"  Length pairs  : {list(zip(args.input_lens, args.output_lens))}")
     print(f"  Output dir    : {args.output_dir}")
-    print(f"  Docker image  : {VLLM_IMAGE}")
+    print(f"  Docker image  : {preset['image']}")
     print(f"  Env vars      : {preset.get('env', {})}")
     print(f"  Engine flags  : {preset.get('engine_flags', {})}")
     print("=" * 70)
@@ -404,8 +420,8 @@ def main() -> None:
             print(f"  WARNING: checkpoint not found: {ckpt_path}")
 
     # Pull Docker image
-    print(f"\nPulling {VLLM_IMAGE} ...")
-    run(["docker", "pull", VLLM_IMAGE], check=False)
+    print(f"\nPulling {preset['image']} ...")
+    run(["docker", "pull", preset["image"]], check=False)
 
     # Run benchmarks for each checkpoint
     results: list[str] = []
