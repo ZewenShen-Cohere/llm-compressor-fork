@@ -26,4 +26,8 @@ from llmcompressor.core.session_functions import (
     create_session,
     reset_session,
 )
-from llmcompressor.entrypoints import Oneshot, oneshot, model_free_ptq
+from llmcompressor.entrypoints import Oneshot, oneshot
+try:
+    from llmcompressor.entrypoints import model_free_ptq
+except ImportError:
+    model_free_ptq = None
