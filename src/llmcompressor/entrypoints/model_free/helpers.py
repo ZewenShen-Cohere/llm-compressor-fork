@@ -4,7 +4,7 @@ from collections import defaultdict
 from typing import Mapping, TypeVar
 
 import torch
-from compressed_tensors.utils.match import match_name
+from compressed_tensors.utils.match import _match_name
 from loguru import logger
 from transformers.file_utils import CONFIG_NAME
 
