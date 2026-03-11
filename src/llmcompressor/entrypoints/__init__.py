@@ -8,5 +8,9 @@ for model optimization tasks.
 """
 
 from .oneshot import Oneshot, oneshot
-from .model_free import model_free_ptq
 from .utils import post_process, pre_process
+
+try:
+    from .model_free import model_free_ptq
+except ImportError:
+    model_free_ptq = None

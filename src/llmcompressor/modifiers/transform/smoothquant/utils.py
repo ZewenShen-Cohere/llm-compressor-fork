@@ -82,12 +82,63 @@ AFMOE_SMOOTHQUANT_MAPPINGS: list[LayerMap] = [
     ),
 ]
 
+# Cohere uses a parallel block: a single input_layernorm feeds both
+# attention (q/k/v_proj) and MLP (gate/up_proj) in parallel.
+COHERE_SMOOTHQUANT_MAPPINGS: list[LayerMap] = [
+    LayerMap(
+        balance_layers=[
+            "re:.*language_model.*q_proj$",
+            "re:.*language_model.*k_proj$",
+            "re:.*language_model.*v_proj$",
+            "re:.*language_model.*gate_proj$",
+            "re:.*language_model.*up_proj$",
+            "re:.*language_model.*mlp\\.gate$",
+        ],
+        smooth_layers="re:.*input_layernorm",
+    ),
+]
+
+
+def _exclude_layers_from_mappings(
+    mappings: list[LayerMap],
+    layer_indices: set[int] = frozenset({0}),
+) -> list[LayerMap]:
+    """Return a copy of *mappings* whose regex patterns skip the given layer indices."""
+    # Build negative lookahead: (?!.*layers\.0\.)(?!.*layers\.1\.)...
+    lookahead = "".join(
+        rf"(?!.*layers\.{i}\.)" for i in sorted(layer_indices)
+    )
+
+    def _add_lookahead(pattern: str) -> str:
+        if pattern.startswith("re:"):
+            return "re:" + lookahead + pattern[3:]
+        return pattern
+
+    return [
+        LayerMap(
+            balance_layers=[_add_lookahead(b) for b in m.balance_layers],
+            smooth_layers=_add_lookahead(m.smooth_layers),
+        )
+        for m in mappings
+    ]
+
+
+# C5 (Cohere2MoE / Cohere2Vision): layer 0 is dense and unquantized,
+# so smooth quant is only applied to layers 1+.
+COHERE_MOE_SMOOTHQUANT_MAPPINGS: list[LayerMap] = _exclude_layers_from_mappings(
+    COHERE_SMOOTHQUANT_MAPPINGS, layer_indices={0}
+)
+
 
 # Registry of layer mappings for different architectures
 #   Add more mappings here
 MAPPINGS_REGISTRY: dict[str, list[LayerMap]] = {
     "BloomForCausalLM": BLOOM_SMOOTHQUANT_MAPPINGS,
     "ChatGLMForConditionalGeneration": BLOOM_SMOOTHQUANT_MAPPINGS,
+    "CohereForCausalLM": COHERE_SMOOTHQUANT_MAPPINGS,
+    "Cohere2ForCausalLM": COHERE_SMOOTHQUANT_MAPPINGS,
+    "Cohere2MoeForCausalLM": COHERE_MOE_SMOOTHQUANT_MAPPINGS,
+    "Cohere2VisionForConditionalGeneration": COHERE_MOE_SMOOTHQUANT_MAPPINGS,
     "DeepseekV2ForCausalLM": DEEPSEEK_V2_SMOOTHQUANT_MAPPINGS,
     "Gemma2ForCausalLM": DEFAULT_SMOOTHQUANT_MAPPINGS,
     "Gemma3ForCausalLM": DEFAULT_SMOOTHQUANT_MAPPINGS,

@@ -1,11 +1,12 @@
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 from compressed_tensors.offload import update_offload_parameter
 from compressed_tensors.utils import match_modules_set, match_named_modules
 from loguru import logger
 from pydantic import ConfigDict, Field
+from safetensors.torch import save_file
 from torch.nn import Module
 from torch.utils._pytree import tree_leaves
 
@@ -101,11 +102,14 @@ class SmoothQuantModifier(Modifier):
     ignore: list[str] | None = None
     num_calibration_steps: int | None = None
     calibration_function: Callable | None = None
+    export_scales_path: Optional[str] = None
+    apply_smoothing: bool = True
 
     resolved_mappings_: list[SmoothQuantMapping] | None = Field(
         default=None, repr=False
     )
     scales_: dict | None = Field(default=None, repr=False)
+    exported_scales_: dict | None = Field(default=None, repr=False)
 
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
@@ -134,6 +138,7 @@ class SmoothQuantModifier(Modifier):
         self.mappings = self._infer_mappings_from_model(state.model)
         self.resolved_mappings_ = self._resolve_mappings(state.model)
         self.scales_ = {}
+        self.exported_scales_ = {} if self.export_scales_path is not None else None
 
         return True
 
@@ -159,6 +164,13 @@ class SmoothQuantModifier(Modifier):
         self.ended_ = True
         self.remove_hooks()  # remove hooks
 
+        if self.exported_scales_ and self.export_scales_path is not None:
+            save_file(self.exported_scales_, self.export_scales_path)
+            logger.info(
+                f"Exported {len(self.exported_scales_)} smoothing scales to "
+                f"{self.export_scales_path}"
+            )
+
     def on_finalize(self, state: State, **kwargs) -> bool:
         """
         Clean up by clearing the scale and mapping data
@@ -173,6 +185,8 @@ class SmoothQuantModifier(Modifier):
             self.scales_.clear()
         if self.resolved_mappings_ is not None:
             self.resolved_mappings_.clear()
+        if self.exported_scales_ is not None:
+            self.exported_scales_.clear()
 
         return True
 
@@ -300,6 +314,10 @@ class SmoothQuantModifier(Modifier):
         X is the to_smooth weights
 
         This modifies the weights of the model in-place.
+
+        If export_scales_path is set, computed scales are accumulated in
+        exported_scales_ and written to disk once in on_end.
+        If apply_smoothing is False, weight modification is skipped (export only).
         """
         for mapping in self.resolved_mappings_:
             if mapping.smooth_name not in self.scales_:
@@ -318,28 +336,35 @@ class SmoothQuantModifier(Modifier):
                 scales, torch.Tensor([MINIMUM_SMOOTHING_SCALE]).to(scales.device)
             )
 
-            @torch.no_grad()
-            def smooth(module):
-                if module in balance_layers:
-                    update_offload_parameter(
-                        module, "weight", module.weight * scales.view(1, -1)
-                    )
-                elif module == smooth_layer:
-                    if module.weight.ndim == 1:
-                        update_offload_parameter(
-                            module, "weight", module.weight / scales
-                        )
-                    else:
-                        update_offload_parameter(
-                            module, "weight", module.weight / scales.view(-1, 1)
-                        )
+            if self.exported_scales_ is not None:
+                self.exported_scales_[mapping.smooth_name] = scales.cpu()
 
-                    if hasattr(module, "bias") and module.bias is not None:
-                        update_offload_parameter(module, "bias", module.bias / scales)
+            if self.apply_smoothing:
 
-            for layer in balance_layers:
-                smooth(layer)
-            smooth(smooth_layer)
+                @torch.no_grad()
+                def smooth(module):
+                    if module in balance_layers:
+                        update_offload_parameter(
+                            module, "weight", module.weight * scales.view(1, -1)
+                        )
+                    elif module == smooth_layer:
+                        if module.weight.ndim == 1:
+                            update_offload_parameter(
+                                module, "weight", module.weight / scales
+                            )
+                        else:
+                            update_offload_parameter(
+                                module, "weight", module.weight / scales.view(-1, 1)
+                            )
+
+                        if hasattr(module, "bias") and module.bias is not None:
+                            update_offload_parameter(
+                                module, "bias", module.bias / scales
+                            )
+
+                for layer in balance_layers:
+                    smooth(layer)
+                smooth(smooth_layer)
 
             # clear calibration data
             del self.scales_[mapping.smooth_name]
