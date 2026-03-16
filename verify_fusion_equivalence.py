@@ -27,6 +27,7 @@ DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
     "float32": torch.float32,
+    "fuse_fp32_infer_bf16": None,  # special mode: fuse in fp32, infer in bf16
 }
 
 
@@ -37,7 +38,10 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
         "--dtype", type=str, default="bfloat16", choices=DTYPE_MAP.keys(),
-        help="Model dtype. Use float32 to verify logic correctness without rounding noise.",
+        help=(
+            "Model dtype. Use float32 to verify logic correctness without rounding noise. "
+            "Use fuse_fp32_infer_bf16 to fuse in fp32 then infer in bf16."
+        ),
     )
     return parser.parse_args()
 
@@ -119,49 +123,56 @@ def fuse_scales_into_model(model, scales: dict[str, torch.Tensor]):
     print(f"\nFused {fused_count} layers total.")
 
 
-def main():
-    args = parse_args()
-    device = torch.device(args.device)
-    dtype = DTYPE_MAP[args.dtype]
+def fuse_scales_into_model_keep_fp32(model, scales: dict[str, torch.Tensor]):
+    """
+    Like fuse_scales_into_model, but assumes model is already in fp32
+    and keeps weights in fp32 (no cast back to original dtype).
+    """
+    state_dict = dict(model.named_parameters())
+    projection_suffixes = ["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "mlp.gate"]
 
-    print(f"Loading tokenizer from {args.model_id} ...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    fused_count = 0
+    for scale_key, scale in scales.items():
+        m = LAYER_IDX_RE.search(scale_key)
+        if m is None:
+            print(f"  WARNING: could not parse layer index from {scale_key}, skipping")
+            continue
+        layer_idx = int(m.group(1))
 
-    attn_impl = "eager" if dtype == torch.float32 else "flash_attention_2"
-    print(f"Loading model from {args.model_id} (dtype={args.dtype}, attn={attn_impl}) ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=dtype,
-        attn_implementation=attn_impl,
-    ).to(device)
+        ln_prefix = scale_key
+        ln_weight_key = f"{ln_prefix}.weight"
+        ln_bias_key = f"{ln_prefix}.bias"
 
-    # Prepare a sample input
-    sample_text = "The quick brown fox jumps over the lazy dog."
-    input_ids = tokenizer(sample_text, return_tensors="pt").input_ids
+        if ln_weight_key in state_dict:
+            s = scale.float().to(state_dict[ln_weight_key].device)
+            state_dict[ln_weight_key].data.div_(s)
+            if ln_bias_key in state_dict:
+                state_dict[ln_bias_key].data.div_(s)
+        else:
+            print(f"  WARNING: {ln_weight_key} not found in model")
+            continue
 
-    # Step 1: get reference logits before fusion
-    print("\nRunning forward pass BEFORE fusion ...")
-    logits_before = get_reference_logits(model, input_ids, device)
-    print(f"  Logits shape: {logits_before.shape}")
-    print(f"  Logits sample (first 5 of last token): {logits_before[0, -1, :5]}")
+        layer_prefix = scale_key[: scale_key.rindex(".input_layernorm")] + "."
+        proj_count = 0
+        for param_name, param in state_dict.items():
+            if not param_name.startswith(layer_prefix):
+                continue
+            if not any(param_name.endswith(f"{sf}.weight") for sf in projection_suffixes):
+                continue
+            s = scale.float().to(param.device)
+            param.data.mul_(s.unsqueeze(0))
+            proj_count += 1
 
-    # Step 2: fuse scales
-    print(f"\nLoading scales from {args.scales_path} ...")
-    scales = load_file(args.scales_path)
-    print(f"  {len(scales)} layer scales loaded")
+        fused_count += 1
+        print(f"  Layer {layer_idx}: fused layernorm + {proj_count} projections")
 
-    print("\nFusing scales into model weights ...")
-    fuse_scales_into_model(model, scales)
+    print(f"\nFused {fused_count} layers total.")
 
-    # Step 3: get logits after fusion
-    print("\nRunning forward pass AFTER fusion ...")
-    logits_after = get_reference_logits(model, input_ids, device)
-    print(f"  Logits shape: {logits_after.shape}")
-    print(f"  Logits sample (first 5 of last token): {logits_after[0, -1, :5]}")
 
-    # Step 4: compare
+def print_comparison(logits_before, logits_after, dtype_label, dtype):
+    """Print comparison metrics between before/after logits."""
     print("\n" + "=" * 60)
-    print(f"COMPARISON (model dtype: {args.dtype})")
+    print(f"COMPARISON (mode: {dtype_label})")
     print("=" * 60)
 
     abs_diff = (logits_before.float() - logits_after.float()).abs()
@@ -179,6 +190,9 @@ def main():
     if dtype == torch.float32:
         tolerance = 1e-3
         label = "fp32"
+    elif dtype_label == "fuse_fp32_infer_bf16":
+        tolerance = 8.0
+        label = "fuse fp32, infer bf16"
     else:
         tolerance = 8.0
         label = "bf16 (rounding over 48 layers)"
@@ -190,12 +204,93 @@ def main():
         if dtype != torch.float32:
             print(f"  Try --dtype float32 to check if this is a rounding issue vs logic bug.")
 
-    # Top-1 token agreement
     top1_before = logits_before[0].argmax(dim=-1)
     top1_after = logits_after[0].argmax(dim=-1)
     agreement = (top1_before == top1_after).float().mean().item()
     print(f"\n  Top-1 token agreement: {agreement * 100:.1f}% "
           f"({(top1_before == top1_after).sum()}/{len(top1_before)} positions)")
+
+
+def main():
+    args = parse_args()
+    device = torch.device(args.device)
+    is_fuse_fp32_infer_bf16 = args.dtype == "fuse_fp32_infer_bf16"
+    dtype = torch.bfloat16 if is_fuse_fp32_infer_bf16 else DTYPE_MAP[args.dtype]
+
+    print(f"Loading tokenizer from {args.model_id} ...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+
+    # Prepare a sample input
+    sample_text = "The quick brown fox jumps over the lazy dog."
+    input_ids = tokenizer(sample_text, return_tensors="pt").input_ids
+
+    if is_fuse_fp32_infer_bf16:
+        # Mode 3: fuse in fp32, infer in bf16
+        # Load in bf16, get reference logits
+        print(f"Loading model from {args.model_id} (dtype=bfloat16, attn=flash_attention_2) ...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        ).to(device)
+
+        print("\nRunning forward pass BEFORE fusion (bf16) ...")
+        logits_before = get_reference_logits(model, input_ids, device)
+        print(f"  Logits shape: {logits_before.shape}")
+        print(f"  Logits sample (first 5 of last token): {logits_before[0, -1, :5]}")
+
+        # Cast to fp32, fuse scales in fp32
+        print("\nCasting model to fp32 for fusion ...")
+        model = model.float()
+
+        print(f"\nLoading scales from {args.scales_path} ...")
+        scales = load_file(args.scales_path)
+        print(f"  {len(scales)} layer scales loaded")
+
+        print("\nFusing scales into model weights (in fp32) ...")
+        fuse_scales_into_model_keep_fp32(model, scales)
+
+        # Cast only parameters back to bf16 (preserve buffer dtypes like
+        # rotary inv_freq which must stay fp32 for precision)
+        print("\nCasting parameters back to bf16 for inference (preserving buffer dtypes) ...")
+        for param in model.parameters():
+            param.data = param.data.to(torch.bfloat16)
+
+        print("\nRunning forward pass AFTER fusion (bf16) ...")
+        logits_after = get_reference_logits(model, input_ids, device)
+        print(f"  Logits shape: {logits_after.shape}")
+        print(f"  Logits sample (first 5 of last token): {logits_after[0, -1, :5]}")
+
+        print_comparison(logits_before, logits_after, "fuse_fp32_infer_bf16", torch.bfloat16)
+
+    else:
+        # Mode 1 (bf16) or Mode 2 (fp32)
+        attn_impl = "eager" if dtype == torch.float32 else "flash_attention_2"
+        print(f"Loading model from {args.model_id} (dtype={args.dtype}, attn={attn_impl}) ...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            torch_dtype=dtype,
+            attn_implementation=attn_impl,
+        ).to(device)
+
+        print("\nRunning forward pass BEFORE fusion ...")
+        logits_before = get_reference_logits(model, input_ids, device)
+        print(f"  Logits shape: {logits_before.shape}")
+        print(f"  Logits sample (first 5 of last token): {logits_before[0, -1, :5]}")
+
+        print(f"\nLoading scales from {args.scales_path} ...")
+        scales = load_file(args.scales_path)
+        print(f"  {len(scales)} layer scales loaded")
+
+        print("\nFusing scales into model weights ...")
+        fuse_scales_into_model(model, scales)
+
+        print("\nRunning forward pass AFTER fusion ...")
+        logits_after = get_reference_logits(model, input_ids, device)
+        print(f"  Logits shape: {logits_after.shape}")
+        print(f"  Logits sample (first 5 of last token): {logits_after[0, -1, :5]}")
+
+        print_comparison(logits_before, logits_after, args.dtype, dtype)
 
 
 if __name__ == "__main__":
