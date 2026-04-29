@@ -200,6 +200,7 @@ def _grid_search_mse(
             max_vals=shrinked_max_val,
             quantization_args=args,
             global_scale=global_scale,
+            observed=observed,
         )
 
         # Note that observed.shape = (num_observations, *qparams_shape, group_size).

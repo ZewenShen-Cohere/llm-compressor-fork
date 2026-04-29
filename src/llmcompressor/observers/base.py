@@ -114,6 +114,7 @@ class Observer(InternalModule, RegistryMixin):
             max_vals=max_vals,
             quantization_args=self.args,
             global_scale=global_scale,
+            observed=observed,
         )
         return scales, zero_points, min_vals, max_vals
 
@@ -183,6 +184,12 @@ class Observer(InternalModule, RegistryMixin):
         max_vals = getattr(self, "past_max_vals", None)
         if min_vals is None or max_vals is None:
             return None
+
+        if getattr(self.args, "mxfp_scale_rounding", None) == "mse":
+            raise ValueError(
+                "Cannot recompute MXFP scale rounding mode 'mse' from synchronized "
+                "min/max values without observed grouped values"
+            )
 
         global_scale = self._get_module_param("global_scale")
         self._check_has_global_scale(global_scale)
